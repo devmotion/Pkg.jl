@@ -10,7 +10,8 @@ import REPL
 using REPL.TerminalMenus
 using ..Types, ..Resolve, ..PlatformEngines, ..GitTools, ..MiniProgressBars
 import ..depots, ..depots1, ..devdir, ..set_readonly, ..Types.PackageEntry
-import ..Artifacts: ensure_all_artifacts_installed, artifact_names, extract_all_hashes, artifact_exists
+import ..Artifacts: ensure_artifact_installed, artifact_names, extract_all_hashes,
+                    artifact_exists, select_downloadable_artifacts
 using Base.BinaryPlatforms
 import ...Pkg
 import ...Pkg: pkg_server, Registry, pathrepr, can_fancyprint, printpkgstyle
@@ -581,10 +582,44 @@ function install_git(
     end
 end
 
-function download_artifacts(env::EnvCache, pkgs::Vector{PackageSpec}; platform::AbstractPlatform=HostPlatform(),
+function collect_artifacts(env::EnvCache, pkg::PackageSpec, pkg_root::String; platform::AbstractPlatform=HostPlatform())
+    # Check to see if this package has an (Julia)Artifacts.toml
+    artifacts_tomls = Tuple{String,Dict}[]
+    for f in artifact_names
+        artifacts_toml = joinpath(pkg_root, f)
+        if isfile(artifacts_toml)
+            selector_path = joinpath(pkg_root, ".pkg", "select_artifacts.jl")
+
+            # If there is a dynamic artifact selector, run that in an appropriate sandbox to select artifacts
+            if isfile(selector_path)
+                registries = Registry.reachable_registries()
+                project = gen_target_project(env, registries, pkg, pkg_root, "select_artifacts")
+                sandbox(env, pkg, pkg_root, joinpath(pkg_root, ".pkg"), project) do
+                    meta_toml = String(read(`$(gen_build_code(selector_path)) $(triplet(platform))`))
+                    push!(artifacts_tomls, (artifacts_toml, TOML.parse(meta_toml)))
+                end
+            else
+                # Otherwise, use the standard selector from `Artifacts`
+                artifacts = select_downloadable_artifacts(artifacts_toml; platform)
+                push!(artifacts_tomls, (artifacts_toml, artifacts))
+            end
+            break
+        end
+    end
+    return artifacts_tomls
+end
+
+
+function download_artifacts(env::EnvCache, pkgs::Vector{PackageSpec};
+                            platform::AbstractPlatform=HostPlatform(),
                             verbose::Bool=false)
     # Filter out packages that have no source_path()
     # pkg_roots = String[p for p in source_path.((env.project_file,), pkgs) if p !== nothing]  # this runs up against inference limits?
+    
+    # Ensure pkgs are sorted in dependency order
+    order = dependency_order_uuids(env, UUID[pkg.uuid for pkg in pkgs if pkg.uuid !== nothing])
+    sort!(pkgs, by = pkg -> order[pkg.uuid])
+
     pkg_roots = String[]
     for pkg in pkgs
         p = source_path(env.project_file, pkg)
@@ -596,22 +631,37 @@ end
 function download_artifacts(pkg_roots::Vector{String}; platform::AbstractPlatform=HostPlatform(),
                             verbose::Bool=false)
     # List of Artifacts.toml files that we're going to download from
-    artifacts_tomls = String[]
+    artifacts_tomls = Tuple{String,Dict}[]
 
     for path in pkg_roots
         # Check to see if this package has an (Julia)Artifacts.toml
         for f in artifact_names
             artifacts_toml = joinpath(path, f)
             if isfile(artifacts_toml)
-                push!(artifacts_tomls, artifacts_toml)
+                selector_path = joinpath(path, ".pkg", "select_artifacts.jl")
+
+                if isfile(selector_path)
+                    meta_toml = String(read(```
+                        $(Base.julia_cmd()) --color=no --history-file=no -O0 --startup-file=no
+                                            --project=$(path) $(selector_path)
+                    ```))
+                    push!(artifacts_tomls, (artifacts_toml, TOML.parse(meta_toml)))
+                else
+                    artifacts = select_downloadable_artifacts(artifacts_toml; platform)
+                    push!(artifacts_tomls, (artifacts_toml, artifacts))
+                end
                 break
             end
         end
     end
 
     if !isempty(artifacts_tomls)
-        for artifacts_toml in artifacts_tomls
-            ensure_all_artifacts_installed(artifacts_toml; platform=platform, verbose=verbose, quiet_download=!(stderr isa Base.TTY))
+        for (artifacts_toml, artifacts) in artifacts_tomls
+            # For each Artifacts.toml, install each artifact we've collected from it
+            for name in keys(artifacts)
+                ensure_artifact_installed(name, artifacts[name], artifacts_toml;
+                                          verbose=verbose, quiet_download=!(stderr isa Base.TTY))
+            end
             write_env_usage(artifacts_toml, "artifact_usage.toml")
         end
     end
@@ -814,7 +864,6 @@ function dependency_order_uuids(env::EnvCache, uuids::Vector{UUID})::Dict{UUID,I
     seen = UUID[]
     k = 0
     function visit(uuid::UUID)
-        is_stdlib(uuid) && return
         uuid in seen &&
             return @warn("Dependency graph not a DAG, linearizing anyway")
         haskey(order, uuid) && return
@@ -823,7 +872,11 @@ function dependency_order_uuids(env::EnvCache, uuids::Vector{UUID})::Dict{UUID,I
             deps = values(env.project.deps)
         else
             entry = manifest_info(env.manifest, uuid)
-            deps = values(entry.deps)
+            if entry !== nothing
+                deps = values(entry.deps)
+            else
+                deps = []
+            end
         end
         foreach(visit, deps)
         pop!(seen)
@@ -925,7 +978,7 @@ function build_versions(ctx::Context, uuids::Vector{UUID}; verbose=false)
 
         fancyprint && show_progress(ctx.io, bar)
 
-        sandbox(ctx, pkg, source_path, builddir(source_path), build_project_override) do
+        sandbox(ctx.env, pkg, source_path, builddir(source_path), build_project_override) do
             flush(stdout)
             ok = open(log_file, "w") do log
                 std = verbose ? ctx.io : log
@@ -1388,9 +1441,9 @@ function abspath!(env::EnvCache, manifest::Dict{UUID,PackageEntry})
 end
 
 # ctx + pkg used to compute parent dep graph
-function sandbox(fn::Function, ctx::Context, target::PackageSpec, target_path::String,
+function sandbox(fn::Function, env::EnvCache, target::PackageSpec, target_path::String,
                  sandbox_path::String, sandbox_project_override)
-    active_manifest = manifestfile_path(dirname(ctx.env.project_file))
+    active_manifest = manifestfile_path(dirname(env.project_file))
     sandbox_project = projectfile_path(sandbox_path)
 
     mktempdir() do tmp
@@ -1407,7 +1460,7 @@ function sandbox(fn::Function, ctx::Context, target::PackageSpec, target_path::S
         # create merged manifest
         # - copy over active subgraph
         # - abspath! to maintain location of all deved nodes
-        working_manifest = abspath!(ctx.env, sandbox_preserve(ctx.env, target, tmp_project))
+        working_manifest = abspath!(env, sandbox_preserve(env, target, tmp_project))
         # - copy over fixed subgraphs from test subgraph
         # really only need to copy over "special" nodes
         sandbox_env = Types.EnvCache(projectfile_path(sandbox_path))
@@ -1568,7 +1621,7 @@ function test(ctx::Context, pkgs::Vector{PackageSpec};
             gen_target_project(ctx.env, ctx.registries, pkg, source_path, "test")
         # now we sandbox
         printpkgstyle(ctx.io, :Testing, pkg.name)
-        sandbox(ctx, pkg, source_path, testdir(source_path), test_project_override) do
+        sandbox(ctx.env, pkg, source_path, testdir(source_path), test_project_override) do
             test_fn !== nothing && test_fn()
             status(Context(); mode=PKGMODE_COMBINED)
             printpkgstyle(ctx.io, :Testing, "Running tests...")
