@@ -1,6 +1,6 @@
 module NewTests
 
-using  Test, UUIDs, Dates
+using  Test, UUIDs, Dates, TOML
 import ..Pkg, LibGit2
 using  Pkg.Types: PkgError
 using  Pkg.Resolve: ResolverError
@@ -2444,6 +2444,75 @@ end
                 Pkg.add(path="BasicSandbox")
             end
         end
+    end
+end
+
+using Pkg.Types: is_stdlib
+@testset "is_stdlib() across versions" begin
+    networkoptions_uuid = UUID("ca575930-c2e3-43a9-ace4-1e988b2c1908")
+    pkg_uuid = UUID("44cfe95a-1eb2-52ea-b672-e2afdf69b78f")
+
+    # Assume we're running on v1.6+
+    @test is_stdlib(networkoptions_uuid)
+    @test is_stdlib(networkoptions_uuid, v"1.6")
+    @test !is_stdlib(networkoptions_uuid, v"1.5")
+    @test !is_stdlib(networkoptions_uuid, v"1.0.0")
+    @test !is_stdlib(networkoptions_uuid, v"0.7")
+    @test !is_stdlib(networkoptions_uuid, nothing)
+
+    @test is_stdlib(pkg_uuid)
+    @test is_stdlib(pkg_uuid, v"1.0")
+    @test is_stdlib(pkg_uuid, v"1.6")
+    @test is_stdlib(pkg_uuid, v"999.999.999")
+    @test !is_stdlib(pkg_uuid, v"0.7")
+    @test !is_stdlib(pkg_uuid, nothing)
+end
+
+@testset "STDLIBS_BY_VERSION up-to-date" begin
+    test_result = Pkg.Types.STDLIBS_BY_VERSION[end][2] == Pkg.Types.load_stdlib()
+    if !test_result
+        @error("STDLIBS_BY_VERSION out of date!  Re-run generate_historical_stdlibs.jl!")
+    end
+    @test test_result
+end
+
+@testset "Pkg.add() with julia_version" begin
+    networkoptions_uuid = "ca575930-c2e3-43a9-ace4-1e988b2c1908"
+
+    function get_manifest_block(name)
+        manifest_path = joinpath(dirname(Base.active_project()), "Manifest.toml")
+        @test isfile(manifest_path)
+        manifest = TOML.parsefile(manifest_path)
+        @test haskey(manifest, name)
+        return first(manifest[name])
+    end
+
+    isolate(loaded_depot=true) do
+        # Test that adding `NetworkOptions` results in a `Manifest.toml` with no version
+        # which means that it was treated as a standard library
+        Pkg.add("NetworkOptions")
+        block = get_manifest_block("NetworkOptions")
+        @test haskey(block, "uuid")
+        @test block["uuid"] == networkoptions_uuid
+        @test !haskey(block, "version")
+    end
+
+    isolate(loaded_depot=true) do
+        # Next, test that if we ask for `v1.5` it DOES have a version
+        Pkg.add("NetworkOptions"; julia_version=v"1.5")
+        block = get_manifest_block("NetworkOptions")
+        @test haskey(block, "uuid")
+        @test block["uuid"] == networkoptions_uuid
+        @test haskey(block, "version")
+    end
+
+    isolate(loaded_depot=true) do
+        # Next, test that if we ask for `nothing` it also does
+        Pkg.add(["NetworkOptions"]; julia_version=nothing)
+        no_block = get_manifest_block("NetworkOptions")
+        @test haskey(no_block, "uuid")
+        @test no_block["uuid"] == networkoptions_uuid
+        @test haskey(no_block, "version")
     end
 end
 

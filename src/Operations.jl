@@ -114,7 +114,7 @@ function is_instantiated(env::EnvCache)::Bool
     return all(pkg -> is_package_downloaded(env.project_file, pkg), pkgs)
 end
 
-function update_manifest!(env::EnvCache, pkgs::Vector{PackageSpec}, deps_map)
+function update_manifest!(env::EnvCache, pkgs::Vector{PackageSpec}, deps_map, julia_version)
     manifest_before = deepcopy(env.manifest)
     manifest = env.manifest
     empty!(manifest)
@@ -124,7 +124,7 @@ function update_manifest!(env::EnvCache, pkgs::Vector{PackageSpec}, deps_map)
     for pkg in pkgs
         entry = PackageEntry(;name = pkg.name, version = pkg.version, pinned = pkg.pinned,
                              tree_hash = pkg.tree_hash, path = pkg.path, repo = pkg.repo)
-        is_stdlib(pkg.uuid) && (entry.version = nothing) # do not set version for stdlibs
+        is_stdlib(pkg.uuid, julia_version) && (entry.version = nothing) # do not set version for stdlibs
         if Types.is_project(env, pkg)
             entry.deps = env.project.deps
         else
@@ -396,7 +396,7 @@ function deps_graph(env::EnvCache, registries::Vector{Registry.RegistryInstance}
             all_compat_u   = get_or_make!(all_compat,   uuid)
 
             # Collect deps + compat for stdlib
-            if is_stdlib(uuid)
+            if is_stdlib(uuid) && julia_version !== nothing
                 path = Types.stdlib_path(stdlibs()[uuid])
                 proj_file = projectfile_path(path; strict=true)
                 @assert proj_file !== nothing
@@ -1145,7 +1145,7 @@ function add(ctx::Context, pkgs::Vector{PackageSpec}, new_git=UUID[];
     foreach(pkg -> ctx.env.project.deps[pkg.name] = pkg.uuid, pkgs) # update set of deps
     # resolve
     pkgs, deps_map = _resolve(ctx.io, ctx.env, ctx.registries, pkgs, preserve, ctx.julia_version)
-    update_manifest!(ctx.env, pkgs, deps_map)
+    update_manifest!(ctx.env, pkgs, deps_map, ctx.julia_version)
     new_apply = download_source(ctx, pkgs)
 
     # After downloading resolutionary packages, search for (Julia)Artifacts.toml files
@@ -1167,7 +1167,7 @@ function develop(ctx::Context, pkgs::Vector{PackageSpec}, new_git::Vector{UUID};
     end
     # resolve & apply package versions
     pkgs, deps_map = _resolve(ctx.io, ctx.env, ctx.registries, pkgs, preserve, ctx.julia_version)
-    update_manifest!(ctx.env, pkgs, deps_map)
+    update_manifest!(ctx.env, pkgs, deps_map, ctx.julia_version)
     new_apply = download_source(ctx, pkgs; readonly=true)
     download_artifacts(ctx.env, pkgs; platform=platform)
     write_env(ctx.env) # write env before building
@@ -1232,7 +1232,7 @@ function up(ctx::Context, pkgs::Vector{PackageSpec}, level::UpgradeLevel)
     pkgs = load_direct_deps(ctx.env, pkgs; preserve = (level == UPLEVEL_FIXED ? PRESERVE_NONE : PRESERVE_DIRECT))
     check_registered(ctx.registries, pkgs)
     deps_map = resolve_versions!(ctx.env, ctx.registries, pkgs, ctx.julia_version)
-    update_manifest!(ctx.env, pkgs, deps_map)
+    update_manifest!(ctx.env, pkgs, deps_map, ctx.julia_version)
     new_apply = download_source(ctx, pkgs)
     download_artifacts(ctx.env, pkgs)
     write_env(ctx.env) # write env before building
@@ -1273,7 +1273,7 @@ function pin(ctx::Context, pkgs::Vector{PackageSpec})
     pkgs = load_direct_deps(ctx.env, pkgs)
 
     pkgs, deps_map = _resolve(ctx.io, ctx.env, ctx.registries, pkgs, PRESERVE_TIERED, ctx.julia_version)
-    update_manifest!(ctx.env, pkgs, deps_map)
+    update_manifest!(ctx.env, pkgs, deps_map, ctx.julia_version)
 
     new = download_source(ctx, pkgs)
     download_artifacts(ctx.env, pkgs)
@@ -1311,7 +1311,7 @@ function free(ctx::Context, pkgs::Vector{PackageSpec})
         pkgs = load_direct_deps(ctx.env, pkgs)
         check_registered(ctx.registries, pkgs)
         pkgs, deps_map = _resolve(ctx.io, ctx.env, ctx.registries, pkgs, PRESERVE_TIERED, ctx.julia_version)
-        update_manifest!(ctx.env, pkgs, deps_map)
+        update_manifest!(ctx.env, pkgs, deps_map, ctx.julia_version)
         new = download_source(ctx, pkgs)
         download_artifacts(ctx.env, new)
         write_env(ctx.env) # write env before building
