@@ -128,7 +128,7 @@ function update_manifest!(ctx::Context, pkgs::Vector{PackageSpec}, deps_map)
     for pkg in pkgs
         entry = PackageEntry(;name = pkg.name, version = pkg.version, pinned = pkg.pinned,
                              tree_hash = pkg.tree_hash, path = pkg.path, repo = pkg.repo)
-        is_stdlib(pkg.uuid) && (entry.version = nothing) # do not set version for stdlibs
+        is_stdlib(pkg.uuid, ctx.julia_version) && (entry.version = nothing) # do not set version for stdlibs
         if Types.is_project(ctx, pkg)
             entry.deps = ctx.env.project.deps
         else
@@ -452,7 +452,7 @@ function deps_graph(ctx::Context, uuid_to_name::Dict{UUID,String}, reqs::Resolve
             all_compat_u   = get_or_make!(all_compat,   uuid)
 
             # Collect deps + compat for stdlib
-            if is_stdlib(uuid)
+            if is_stdlib(uuid) && ctx.julia_version !== nothing
                 path = Types.stdlib_path(stdlibs()[uuid])
                 proj_file = projectfile_path(path; strict=true)
                 @assert proj_file !== nothing

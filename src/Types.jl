@@ -41,6 +41,9 @@ const VersionsDict  = Dict{UUID,Set{VersionNumber}}
 const DepsDict      = Dict{UUID,DepsValDict}
 const CompatDict    = Dict{UUID,CompatValDict}
 
+# Load in data about historical stdlibs
+include("HistoricalStdlibs.jl")
+
 const URL_regex = r"((file|git|ssh|http(s)?)|(git@[\w\-\.]+))(:(//)?)([\w\.@\:/\-~]+)(\.git)?(/)?"x
 
 #################
@@ -358,6 +361,27 @@ function stdlibs()
     return STDLIB[]
 end
 is_stdlib(uuid::UUID) = uuid in keys(stdlibs())
+
+# Allow asking if something is an stdlib for a particular version of Julia
+function is_stdlib(uuid::UUID, julia_version::Union{VersionNumber, Nothing})
+    # If `julia_version` is `nothing`, we will just never say anything is an stdlib.
+    if julia_version === nothing
+        return false
+    end
+
+    # Otherwise, find the entry in `STDLIBS_BY_VERSION` that corresponds to the requested version.
+    last_stdlibs = Dict{UUID,String}()
+    for (version, stdlibs) in STDLIBS_BY_VERSION
+        if julia_version < version
+            break
+        end
+        last_stdlibs = stdlibs
+    end
+
+    # Note that if the user asks for something like `julia_version = 0.7.0`, we'll
+    # fall through with `last_stdlibs` as the initial case, which will always be `false`.
+    return uuid in keys(last_stdlibs)
+end
 
 Context!(kw_context::Vector{Pair{Symbol,Any}})::Context =
     Context!(Context(); kw_context...)
