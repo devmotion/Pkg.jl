@@ -111,8 +111,12 @@ end
 function is_instantiated(env::EnvCache)::Bool
     # Load everything
     pkgs = load_all_deps(env)
-    # Make sure all paths exist
-    return all(pkg -> is_package_downloaded(env.project_file, pkg), pkgs)
+    # If the top-level project is a package, ensure it is instantiated as well
+    if env.pkg !== nothing
+        push!(pkgs, Types.PackageSpec(name=env.pkg.name, uuid=env.pkg.uuid, version=env.pkg.version, path=dirname(env.project_file)))
+    end
+    # Make sure all paths/artifacts exist
+    return all(pkg -> is_package_downloaded(env, env.project_file, pkg), pkgs)
 end
 
 function update_manifest!(env::EnvCache, pkgs::Vector{PackageSpec}, deps_map)
@@ -422,7 +426,7 @@ function deps_graph(env::EnvCache, registries::Vector{Registry.RegistryInstance}
                         Registry.isyanked(info, v) && continue
                         if Pkg.OFFLINE_MODE[]
                             pkg_spec = PackageSpec(name=pkg.name, uuid=pkg.uuid, version=v, tree_hash=Registry.treehash(info, v))
-                            is_package_downloaded(env.project_file, pkg_spec) || continue
+                            is_package_downloaded(env, env.project_file, pkg_spec) || continue
                         end
 
                         all_compat_u[v] = compat_info
@@ -613,69 +617,39 @@ end
 function download_artifacts(env::EnvCache, pkgs::Vector{PackageSpec};
                             platform::AbstractPlatform=HostPlatform(),
                             verbose::Bool=false)
-    # Filter out packages that have no source_path()
-    # pkg_roots = String[p for p in source_path.((env.project_file,), pkgs) if p !== nothing]  # this runs up against inference limits?
-    
     # Ensure pkgs are sorted in dependency order
     order = dependency_order_uuids(env, UUID[pkg.uuid for pkg in pkgs if pkg.uuid !== nothing])
     sort!(pkgs, by = pkg -> order[pkg.uuid])
 
-    pkg_roots = String[]
     for pkg in pkgs
-        p = source_path(env.project_file, pkg)
-        p !== nothing && push!(pkg_roots, p)
+        pkg_root = source_path(env.project_file, pkg)
+        # Only collect packages that actually have a `source_path`
+        if pkg_root !== nothing
+            download_artifacts(env, pkg, pkg_root; platform, verbose)
+        end
     end
-    return download_artifacts(pkg_roots; platform=platform, verbose=verbose)
 end
 
-function download_artifacts(pkg_roots::Vector{String}; platform::AbstractPlatform=HostPlatform(),
+function download_artifacts(env::EnvCache, pkg::PackageSpec, pkg_root::String;
+                            platform::AbstractPlatform=HostPlatform(),
                             verbose::Bool=false)
     # List of Artifacts.toml files that we're going to download from
-    artifacts_tomls = Tuple{String,Dict}[]
-
-    for path in pkg_roots
-        # Check to see if this package has an (Julia)Artifacts.toml
-        for f in artifact_names
-            artifacts_toml = joinpath(path, f)
-            if isfile(artifacts_toml)
-                selector_path = joinpath(path, ".pkg", "select_artifacts.jl")
-
-                if isfile(selector_path)
-                    meta_toml = String(read(```
-                        $(Base.julia_cmd()) --color=no --history-file=no -O0 --startup-file=no
-                                            --project=$(path) $(selector_path)
-                    ```))
-                    push!(artifacts_tomls, (artifacts_toml, TOML.parse(meta_toml)))
-                else
-                    artifacts = select_downloadable_artifacts(artifacts_toml; platform)
-                    push!(artifacts_tomls, (artifacts_toml, artifacts))
-                end
-                break
-            end
+    for (artifacts_toml, artifacts) in collect_artifacts(env, pkg, pkg_root; platform)
+        # For each Artifacts.toml, install each artifact we've collected from it
+        for name in keys(artifacts)
+            ensure_artifact_installed(name, artifacts[name], artifacts_toml;
+                                      verbose, quiet_download=!(stderr isa Base.TTY))
         end
-    end
-
-    if !isempty(artifacts_tomls)
-        for (artifacts_toml, artifacts) in artifacts_tomls
-            # For each Artifacts.toml, install each artifact we've collected from it
-            for name in keys(artifacts)
-                ensure_artifact_installed(name, artifacts[name], artifacts_toml;
-                                          verbose=verbose, quiet_download=!(stderr isa Base.TTY))
-            end
-            write_env_usage(artifacts_toml, "artifact_usage.toml")
-        end
+        write_env_usage(artifacts_toml, "artifact_usage.toml")
     end
 end
 
-function check_artifacts_downloaded(pkg_root::String; platform::AbstractPlatform=HostPlatform())
-    for f in artifact_names
-        artifacts_toml = joinpath(pkg_root, f)
-        if isfile(artifacts_toml)
-            hashes = extract_all_hashes(artifacts_toml)
-            if !all(artifact_exists.(hashes))
+function check_artifacts_downloaded(env::EnvCache, pkg::PackageSpec, pkg_root::String; platform::AbstractPlatform=HostPlatform())
+    for (artifacts_toml, artifacts) in collect_artifacts(env, pkg, pkg_root; platform)
+        for name in keys(artifacts)
+            if !artifact_exists(Base.SHA1(artifacts[name]["git-tree-sha1"]))
                 return false
             end
-            break
         end
     end
     return true
@@ -1713,11 +1687,11 @@ function diff_array(old_ctx::Union{Context,Nothing}, new_ctx::Context; manifest=
     return Tuple{T,S,S}[(uuid, index_pkgs(old, uuid), index_pkgs(new, uuid))::Tuple{T,S,S} for uuid in all_uuids]
 end
 
-function is_package_downloaded(project_file::String, pkg::PackageSpec)
+function is_package_downloaded(env::EnvCache, project_file::String, pkg::PackageSpec; platform::AbstractPlatform=HostPlatform())
     sourcepath = source_path(project_file, pkg)
     @assert sourcepath !== nothing
     isdir(sourcepath) || return false
-    check_artifacts_downloaded(sourcepath) || return false
+    check_artifacts_downloaded(env, pkg, sourcepath; platform) || return false
     return true
 end
 
@@ -1754,7 +1728,7 @@ function print_status(ctx::Context, old_ctx::Union{Nothing,Context}, header::Sym
         if Types.is_project_uuid(ctx.env, uuid)
             continue
         end
-        pkg_downloaded = !is_instantiated(new) || is_package_downloaded(ctx.env.project_file, new)
+        pkg_downloaded = !is_instantiated(new) || is_package_downloaded(ctx.env, ctx.env.project_file, new)
         all_packages_downloaded &= pkg_downloaded
         print(ctx.io, pkg_downloaded ? " " : not_installed_indicator)
         printstyled(ctx.io, " [", string(uuid)[1:8], "] "; color = :light_black)

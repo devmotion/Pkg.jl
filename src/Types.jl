@@ -277,6 +277,7 @@ function EnvCache(env::Union{Nothing,String}=nothing)
             name = project.name,
             uuid = project.uuid,
             version = something(project.version, VersionNumber("0.0")),
+            path = project_dir,
         )
     else
         project_package = nothing
